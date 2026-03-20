@@ -1,0 +1,5 @@
+{
+  "name": "Discord Bot Control Panel",
+  "description": "A clean, minimalist control panel to host and manage a Discord bot with moderation and utility commands.",
+  "requestFramePermissions": []
+}
