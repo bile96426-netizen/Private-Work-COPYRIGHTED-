@@ -11,6 +11,15 @@ import play from 'play-dl';
 import cors from 'cors';
 import path from 'path';
 
+// Global error handlers to prevent crashes from unhandled play-dl promise rejections (e.g., 429 Too Many Requests)
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
 // @ts-ignore
 const spotify = spotifyUrlInfo(fetch);
 
@@ -29,6 +38,8 @@ const startTime = Date.now();
 interface QueueItem {
   title: string;
   url: string;
+  duration: number; // in seconds
+  thumbnail?: string;
 }
 
 interface GuildQueue {
@@ -38,6 +49,18 @@ interface GuildQueue {
   connection: VoiceConnection | null;
   playing: boolean;
   vcJoinTime: number | null;
+  volume: number;
+  seekTime: number; // in seconds
+  streamStartTime: number; // Date.now() when stream started
+  paused: boolean;
+  autoPause: boolean;
+  defaultSource: 'youtube' | 'spotify' | 'soundcloud';
+  aloneTime: number | null;
+  panelMessage: any | null;
+  voiceoverPlayer: any | null;
+  textChannel: any | null;
+  speed: number;
+  bufferingTimeout: NodeJS.Timeout | null;
 }
 
 const queues = new Map<string, GuildQueue>();
@@ -45,26 +68,59 @@ const queues = new Map<string, GuildQueue>();
 function getQueue(guildId: string): GuildQueue {
   if (!queues.has(guildId)) {
     const player = createAudioPlayer();
+    
+    player.on('stateChange', (oldState, newState) => {
+      const q = queues.get(guildId);
+      if (!q) return;
+      
+      if (newState.status === AudioPlayerStatus.Playing) {
+        if (q.bufferingTimeout) {
+          clearTimeout(q.bufferingTimeout);
+          q.bufferingTimeout = null;
+        }
+      } else if (newState.status === AudioPlayerStatus.Buffering) {
+        if (!q.bufferingTimeout) {
+          q.bufferingTimeout = setTimeout(() => {
+            console.log(`Stream stuck in buffering for guild ${guildId}, skipping track...`);
+            if (q.bufferingTimeout) {
+              clearTimeout(q.bufferingTimeout);
+              q.bufferingTimeout = null;
+            }
+            player.stop(); // This will trigger Idle and playNext
+          }, 15000); // 15 seconds timeout
+        }
+      }
+    });
+
     player.on(AudioPlayerStatus.Idle, () => {
       const q = queues.get(guildId);
-      if (q) {
+      if (q && !q.voiceoverPlayer) {
+        if (q.bufferingTimeout) {
+          clearTimeout(q.bufferingTimeout);
+          q.bufferingTimeout = null;
+        }
         if (q.items.length > 0) {
           if (q.loop) {
-            // Move current to end
             const current = q.items.shift();
             if (current) q.items.push(current);
           } else {
             q.items.shift();
           }
         }
+        q.seekTime = 0;
         playNext(guildId);
       }
     });
     player.on('error', error => {
       console.error('Error in audio player:', error);
       const q = queues.get(guildId);
-      if (q) {
+      if (q && !q.voiceoverPlayer) {
+        if (q.bufferingTimeout) {
+          clearTimeout(q.bufferingTimeout);
+          q.bufferingTimeout = null;
+        }
         q.items.shift();
+        q.seekTime = 0;
         playNext(guildId);
       }
     });
@@ -74,39 +130,194 @@ function getQueue(guildId: string): GuildQueue {
       player,
       connection: null,
       playing: false,
-      vcJoinTime: null
+      vcJoinTime: null,
+      volume: 0.4,
+      seekTime: 0,
+      streamStartTime: 0,
+      paused: false,
+      autoPause: true,
+      defaultSource: 'youtube',
+      aloneTime: null,
+      panelMessage: null,
+      voiceoverPlayer: null,
+      textChannel: null,
+      speed: 1,
+      bufferingTimeout: null,
     });
   }
   return queues.get(guildId)!;
 }
 
-async function playNext(guildId: string) {
+async function playVoiceover(query: string, connection: any, playerToRestore: any) {
+  try {
+    let searchResult;
+    try {
+      searchResult = await play.search(query, { limit: 1, source: { youtube: 'video' } });
+    } catch (err: any) {
+      console.log(`YouTube search failed, falling back to SoundCloud for ${query}`);
+      searchResult = await play.search(query, { limit: 1, source: { soundcloud: 'tracks' } });
+    }
+    
+    if (!searchResult || searchResult.length === 0) return;
+    
+    let stream;
+    try {
+      stream = await play.stream(searchResult[0].url);
+    } catch (err: any) {
+      console.log(`YouTube stream failed, falling back to SoundCloud for ${query}`);
+      const scInfo = await play.search(query, { limit: 1, source: { soundcloud: 'tracks' } });
+      if (scInfo && scInfo.length > 0) {
+        stream = await play.stream(scInfo[0].url);
+      } else {
+        throw err;
+      }
+    }
+    
+    // Catch any stream errors to prevent crashes
+    stream.stream.on('error', (err) => {
+      console.error('Voiceover stream error:', err);
+    });
+
+    const resource = createAudioResource(stream.stream, { inputType: stream.type });
+    const voiceoverPlayer = createAudioPlayer();
+    connection.subscribe(voiceoverPlayer);
+    voiceoverPlayer.play(resource);
+    
+    return new Promise<void>((resolve) => {
+      voiceoverPlayer.on(AudioPlayerStatus.Idle, () => {
+        if (connection && playerToRestore) {
+          connection.subscribe(playerToRestore);
+        }
+        resolve();
+      });
+      setTimeout(() => {
+        if (connection && playerToRestore) {
+          connection.subscribe(playerToRestore);
+        }
+        resolve();
+      }, 15000); // fallback timeout
+    });
+  } catch (e) {
+    // Suppress voiceover errors to avoid log clutter if YouTube blocks the stream
+  }
+}
+
+async function updatePanel(guildId: string) {
+  const queue = queues.get(guildId);
+  if (!queue || !queue.panelMessage || queue.items.length === 0) return;
+
+  const item = queue.items[0];
+  const currentSeek = queue.paused ? queue.seekTime : queue.seekTime + (Date.now() - queue.streamStartTime) / 1000;
+  
+  const progress = Math.min(currentSeek / item.duration, 1);
+  const barLength = 15;
+  const filled = Math.floor(progress * barLength);
+  const empty = barLength - filled;
+  const bar = '▬'.repeat(Math.max(0, filled)) + '🔘' + '▬'.repeat(Math.max(0, empty));
+
+  const formatTime = (secs: number) => {
+    const m = Math.floor(secs / 60);
+    const s = Math.floor(secs % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
+  const embed = new EmbedBuilder()
+    .setTitle('Now Playing')
+    .setDescription(`**[${item.title}](${item.url})**\n\n${queue.paused ? '⏸️' : '▶️'} ${bar} \`${formatTime(currentSeek)} / ${formatTime(item.duration)}\`\n\n🔊 Volume: ${Math.round(queue.volume * 100)}% | ⚡ Speed: ${queue.speed}x`)
+    .setColor(0x0099FF);
+  
+  if (item.thumbnail) embed.setThumbnail(item.thumbnail);
+
+  const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId('vc_rewind').setEmoji('⏪').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('vc_playpause').setEmoji('⏯️').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('vc_forward').setEmoji('⏩').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('vc_voldown').setEmoji('🔉').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('vc_volup').setEmoji('🔊').setStyle(ButtonStyle.Secondary)
+  );
+
+  const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId('vc_speed').setLabel(`Speed: ${queue.speed}x`).setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('vc_stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
+  );
+
+  try {
+    await queue.panelMessage.edit({ embeds: [embed], components: [row1, row2] });
+  } catch (e) {
+    // Message might be deleted
+    queue.panelMessage = null;
+  }
+}
+
+async function playNext(guildId: string, seek: number = 0) {
   const queue = getQueue(guildId);
   if (queue.items.length === 0) {
     queue.playing = false;
+    if (queue.panelMessage) {
+      queue.panelMessage.edit({ content: 'Queue finished.', embeds: [], components: [] }).catch(() => {});
+      queue.panelMessage = null;
+    }
     return;
   }
 
   const item = queue.items[0];
   try {
-    const stream = await play.stream(item.url);
-    const bufferStream = new PassThrough({ highWaterMark: 1024 * 1024 * 10 });
-    stream.stream.pipe(bufferStream);
+    let stream;
+    try {
+      stream = await play.stream(item.url, { seek });
+    } catch (err: any) {
+      console.log(`YouTube stream failed, falling back to SoundCloud for ${item.title}`);
+      const scInfo = await play.search(item.title, { limit: 1, source: { soundcloud: 'tracks' } });
+      if (scInfo && scInfo.length > 0) {
+        stream = await play.stream(scInfo[0].url, { seek });
+      } else {
+        throw err;
+      }
+    }
     
-    const resource = createAudioResource(bufferStream, { 
+    // Using the stream directly instead of PassThrough to prevent audio distortion/clipping
+    // Catch any stream errors to prevent crashes
+    stream.stream.on('error', (err) => {
+      console.error('Stream error:', err);
+      // The buffering timeout or player error handler will catch this and skip
+    });
+
+    const resource = createAudioResource(stream.stream, { 
       inputType: stream.type,
       inlineVolume: true
     });
-    resource.volume?.setVolume(0.6);
+    // Set a slightly lower default volume to prevent "screaming" distortion
+    resource.volume?.setVolume(queue.volume * 0.5); // Scale down the volume to prevent clipping
 
     queue.player.play(resource);
     queue.playing = true;
+    queue.paused = false;
+    queue.seekTime = seek;
+    queue.streamStartTime = Date.now();
+
+    if (queue.textChannel && !queue.panelMessage && seek === 0) {
+      const msg = await queue.textChannel.send({ content: 'Loading player...' });
+      queue.panelMessage = msg;
+    }
+    
+    updatePanel(guildId);
   } catch (error) {
     console.error('Error playing next:', error);
+    if (queue.textChannel) {
+      queue.textChannel.send({ content: `Failed to play **${item.title}**. Skipping to next track.` }).catch(() => {});
+    }
     queue.items.shift();
-    playNext(guildId);
+    setTimeout(() => playNext(guildId), 2000);
   }
 }
+
+setInterval(() => {
+  for (const [guildId, queue] of queues.entries()) {
+    if (queue.playing && !queue.paused && queue.panelMessage) {
+      updatePanel(guildId);
+    }
+  }
+}, 5000);
 
 const commands = [
   new SlashCommandBuilder()
@@ -145,20 +356,23 @@ const commands = [
     .setName('stop')
     .setDescription('Stops playing and leaves VC (Owner Only)'),
   new SlashCommandBuilder()
+    .setName('leave')
+    .setDescription('Leaves VC (Owner Only)'),
+  new SlashCommandBuilder()
     .setName('queue')
     .setDescription('Shows the current audio queue'),
   new SlashCommandBuilder()
     .setName('247')
     .setDescription('Toggles 24/7 mode (repeats the queue forever) (Owner Only)'),
   new SlashCommandBuilder()
+    .setName('settings-vc')
+    .setDescription('Configure VC settings (Owner Only)'),
+  new SlashCommandBuilder()
     .setName('uptime')
     .setDescription('Shows the bot uptime'),
   new SlashCommandBuilder()
     .setName('vc-time')
     .setDescription('Shows how long the bot has been in the current VC'),
-  new SlashCommandBuilder()
-    .setName('pump')
-    .setDescription('Makes the bot freak out and spam 100 messages'),
   new SlashCommandBuilder()
     .setName('host')
     .setDescription('Host command'),
@@ -375,11 +589,23 @@ async function startBot(token: string) {
         if (!voiceChannel) {
           return interaction.reply({ content: 'You need to be in a voice channel to use this command.', ephemeral: true });
         }
-        joinVoiceChannel({
+        const queue = getQueue(interaction.guild.id);
+        queue.connection = joinVoiceChannel({
           channelId: voiceChannel.id,
           guildId: interaction.guild.id,
           adapterCreator: interaction.guild.voiceAdapterCreator as any,
         });
+        queue.connection.subscribe(queue.player);
+        queue.vcJoinTime = Date.now();
+        
+        // 40s timer for "Aaron are you lost"
+        setTimeout(async () => {
+          const q = getQueue(interaction.guild!.id);
+          if (q.connection && !q.playing) {
+            await playVoiceover('Aaron are you lost? Play an Audio using the command slash play and your specified search. Key=91dbdl', q.connection, q.player);
+          }
+        }, 40000);
+        
         await interaction.reply({ content: `Connected to ${voiceChannel.name}.` });
       } else if (commandName === 'play') {
         if (interaction.user.id !== OWNER_ID) {
@@ -422,17 +648,53 @@ async function startBot(token: string) {
             }
           }
 
-          // Search SoundCloud with the extracted query
-          const scInfo = await play.search(query, { limit: 1, source: { soundcloud: 'tracks' } });
-          if (!scInfo || scInfo.length === 0) {
-            return interaction.editReply({ content: `Could not find a match for **${title}** on SoundCloud.` });
+          const queue = getQueue(interaction.guild.id);
+          queue.textChannel = interaction.channel;
+
+          let trackTitle = title;
+          let trackUrl = '';
+          let duration = 0;
+          let thumbnail = undefined;
+
+          if (queue.defaultSource === 'youtube' || audio!.includes('youtube.com') || audio!.includes('youtu.be') || queue.defaultSource === 'spotify' || audio!.includes('spotify.com')) {
+            let searchResult;
+            try {
+              searchResult = await play.search(query, { limit: 1, source: { youtube: 'video' } });
+            } catch (err: any) {
+              console.log(`YouTube search failed, falling back to SoundCloud for ${query}`);
+              searchResult = await play.search(query, { limit: 1, source: { soundcloud: 'tracks' } });
+              if (searchResult && searchResult.length > 0) {
+                trackTitle = searchResult[0].name || (searchResult[0] as any).title || title;
+                trackUrl = searchResult[0].url;
+                duration = searchResult[0].durationInSec;
+                thumbnail = searchResult[0].thumbnail;
+              } else {
+                return interaction.editReply({ content: `Could not find a match for **${title}** on YouTube or SoundCloud.` });
+              }
+            }
+            
+            if (!trackUrl) {
+              if (!searchResult || searchResult.length === 0) {
+                 return interaction.editReply({ content: `Could not find a match for **${title}** on YouTube.` });
+              }
+              trackTitle = searchResult[0].title || title;
+              trackUrl = searchResult[0].url;
+              duration = searchResult[0].durationInSec;
+              thumbnail = searchResult[0].thumbnails?.[0]?.url;
+            }
+          } else {
+            // SoundCloud
+            const scInfo = await play.search(query, { limit: 1, source: { soundcloud: 'tracks' } });
+            if (!scInfo || scInfo.length === 0) {
+              return interaction.editReply({ content: `Could not find a match for **${title}** on SoundCloud.` });
+            }
+            trackTitle = scInfo[0].name || (scInfo[0] as any).title;
+            trackUrl = scInfo[0].url;
+            duration = scInfo[0].durationInSec;
+            thumbnail = scInfo[0].thumbnail;
           }
 
-          const trackTitle = scInfo[0].name || (scInfo[0] as any).title;
-          const trackUrl = scInfo[0].url;
-
-          const queue = getQueue(interaction.guild.id);
-          queue.items.push({ title: trackTitle, url: trackUrl });
+          queue.items.push({ title: trackTitle, url: trackUrl, duration, thumbnail });
 
           if (!queue.connection) {
             queue.connection = joinVoiceChannel({
@@ -463,22 +725,31 @@ async function startBot(token: string) {
           console.error('Error playing audio:', error);
           await interaction.editReply({ content: 'An error occurred while trying to play the audio. The streaming service might be blocking the connection.' });
         }
-      } else if (commandName === 'stop') {
+      } else if (commandName === 'stop' || commandName === 'leave') {
         if (interaction.user.id !== OWNER_ID) {
           return interaction.reply({ content: 'This command is owner only.', ephemeral: true });
         }
         if (!interaction.guild) return interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
         
         const queue = getQueue(interaction.guild.id);
-        queue.items = [];
-        queue.playing = false;
-        queue.player.stop();
+        
+        await interaction.deferReply();
+        
         if (queue.connection) {
+          await playVoiceover('Aaron goodbye Key=91dbdl', queue.connection, null);
           queue.connection.destroy();
           queue.connection = null;
         }
+        
+        queue.items = [];
+        queue.playing = false;
+        queue.player.stop();
         queue.vcJoinTime = null;
-        await interaction.reply({ content: 'Stopped playing and left the voice channel.' });
+        if (queue.panelMessage) {
+          queue.panelMessage.edit({ content: 'Stopped playing.', embeds: [], components: [] }).catch(() => {});
+          queue.panelMessage = null;
+        }
+        await interaction.editReply({ content: 'Stopped playing and left the voice channel.' });
       } else if (commandName === 'queue') {
         if (!interaction.guild) return interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
         const queue = getQueue(interaction.guild.id);
@@ -525,14 +796,26 @@ async function startBot(token: string) {
         const seconds = Math.floor((vcTimeMs % (60 * 1000)) / 1000);
         
         await interaction.reply({ content: `**Time in VC:** ${hours}h ${minutes}m ${seconds}s` });
-      } else if (commandName === 'pump') {
-        await interaction.reply({ content: 'Pumping...', ephemeral: true });
-        if (interaction.channel) {
-          for (let i = 0; i < 100; i++) {
-            const msg = await interaction.channel.send('yo bro hehehhe');
-            setTimeout(() => msg.delete().catch(() => {}), 1000);
-          }
+      } else if (commandName === 'settings-vc') {
+        if (interaction.user.id !== OWNER_ID) {
+          return interaction.reply({ content: 'This command is owner only.', ephemeral: true });
         }
+        if (!interaction.guild) return interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+        
+        const queue = getQueue(interaction.guild.id);
+        
+        const embed = new EmbedBuilder()
+          .setTitle('VC Settings')
+          .setDescription('Configure the bot\'s behavior in voice channels.')
+          .setColor(0x0099FF);
+          
+        const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId('settings_247').setLabel(`24/7 Mode: ${queue.loop ? 'ON' : 'OFF'}`).setStyle(queue.loop ? ButtonStyle.Success : ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('settings_autopause').setLabel(`Auto-Pause: ${queue.autoPause ? 'ON' : 'OFF'}`).setStyle(queue.autoPause ? ButtonStyle.Success : ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('settings_source').setLabel(`Source: ${queue.defaultSource}`).setStyle(ButtonStyle.Primary)
+        );
+        
+        await interaction.reply({ embeds: [embed], components: [row1] });
       } else if (commandName === 'host') {
         await interaction.reply({ content: "that's not available yet, directly message the owner for it", ephemeral: true });
       } else if (commandName === 'help') {
@@ -549,7 +832,6 @@ async function startBot(token: string) {
 \`/247\` - Toggles 24/7 mode (repeats the queue forever) (Owner only)
 \`/uptime\` - Shows the bot uptime
 \`/vc-time\` - Shows how long the bot has been in the current VC
-\`/pump\` - Spams 100 messages and deletes them
 \`/host\` - Secret message
 \`/help\` - Shows this help message`;
         await interaction.reply({ content: helpText, ephemeral: true });
@@ -577,7 +859,166 @@ async function startBot(token: string) {
           await interaction.reply({ content: `Failed to DM user <@${userId}>. They might have DMs disabled.`, ephemeral: true });
           await interaction.message.edit({ components: [] }).catch(() => {});
         }
+      } else if (customId.startsWith('vc_') || customId.startsWith('settings_')) {
+        if (!interaction.guild) return interaction.reply({ content: 'Must be in a server.', ephemeral: true });
+        const queue = getQueue(interaction.guild.id);
+        
+        if (customId === 'vc_playpause') {
+          if (queue.paused) {
+            queue.player.unpause();
+            queue.paused = false;
+            queue.streamStartTime = Date.now();
+          } else {
+            queue.player.pause();
+            queue.paused = true;
+            queue.seekTime += (Date.now() - queue.streamStartTime) / 1000;
+          }
+          await interaction.deferUpdate();
+          updatePanel(interaction.guild.id);
+        } else if (customId === 'vc_rewind') {
+          const currentSeek = queue.paused ? queue.seekTime : queue.seekTime + (Date.now() - queue.streamStartTime) / 1000;
+          const newSeek = Math.max(0, currentSeek - 10);
+          await interaction.deferUpdate();
+          playNext(interaction.guild.id, newSeek);
+        } else if (customId === 'vc_forward') {
+          const currentSeek = queue.paused ? queue.seekTime : queue.seekTime + (Date.now() - queue.streamStartTime) / 1000;
+          const newSeek = currentSeek + 10;
+          await interaction.deferUpdate();
+          playNext(interaction.guild.id, newSeek);
+        } else if (customId === 'vc_voldown') {
+          queue.volume = Math.max(0, queue.volume - 0.1);
+          if (queue.playing) {
+            // Re-play to apply volume if inlineVolume isn't updating dynamically
+            // Wait, inlineVolume can be updated dynamically if we have the resource
+            // But we don't store the resource. Let's just replay from current seek
+            const currentSeek = queue.paused ? queue.seekTime : queue.seekTime + (Date.now() - queue.streamStartTime) / 1000;
+            await interaction.deferUpdate();
+            playNext(interaction.guild.id, currentSeek);
+          } else {
+            await interaction.deferUpdate();
+          }
+        } else if (customId === 'vc_volup') {
+          queue.volume = Math.min(1, queue.volume + 0.1);
+          if (queue.playing) {
+            const currentSeek = queue.paused ? queue.seekTime : queue.seekTime + (Date.now() - queue.streamStartTime) / 1000;
+            await interaction.deferUpdate();
+            playNext(interaction.guild.id, currentSeek);
+          } else {
+            await interaction.deferUpdate();
+          }
+        } else if (customId === 'vc_speed') {
+          const speeds = [0.5, 1, 1.5, 2];
+          const currentIndex = speeds.indexOf(queue.speed);
+          queue.speed = speeds[(currentIndex + 1) % speeds.length];
+          if (queue.playing) {
+            const currentSeek = queue.paused ? queue.seekTime : queue.seekTime + (Date.now() - queue.streamStartTime) / 1000;
+            await interaction.deferUpdate();
+            playNext(interaction.guild.id, currentSeek);
+          } else {
+            await interaction.deferUpdate();
+          }
+        } else if (customId === 'vc_stop') {
+          queue.items = [];
+          queue.playing = false;
+          queue.player.stop();
+          if (queue.connection) {
+            queue.connection.destroy();
+            queue.connection = null;
+          }
+          queue.vcJoinTime = null;
+          if (queue.panelMessage) {
+            queue.panelMessage.edit({ content: 'Stopped playing.', embeds: [], components: [] }).catch(() => {});
+            queue.panelMessage = null;
+          }
+          await interaction.reply({ content: 'Stopped playing and left the voice channel.', ephemeral: true });
+        } else if (customId === 'settings_247') {
+          queue.loop = !queue.loop;
+          const embed = new EmbedBuilder()
+            .setTitle('VC Settings')
+            .setDescription('Configure the bot\'s behavior in voice channels.')
+            .setColor(0x0099FF);
+          const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder().setCustomId('settings_247').setLabel(`24/7 Mode: ${queue.loop ? 'ON' : 'OFF'}`).setStyle(queue.loop ? ButtonStyle.Success : ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId('settings_autopause').setLabel(`Auto-Pause: ${queue.autoPause ? 'ON' : 'OFF'}`).setStyle(queue.autoPause ? ButtonStyle.Success : ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId('settings_source').setLabel(`Source: ${queue.defaultSource}`).setStyle(ButtonStyle.Primary)
+          );
+          await interaction.update({ embeds: [embed], components: [row1] });
+        } else if (customId === 'settings_autopause') {
+          queue.autoPause = !queue.autoPause;
+          const embed = new EmbedBuilder()
+            .setTitle('VC Settings')
+            .setDescription('Configure the bot\'s behavior in voice channels.')
+            .setColor(0x0099FF);
+          const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder().setCustomId('settings_247').setLabel(`24/7 Mode: ${queue.loop ? 'ON' : 'OFF'}`).setStyle(queue.loop ? ButtonStyle.Success : ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId('settings_autopause').setLabel(`Auto-Pause: ${queue.autoPause ? 'ON' : 'OFF'}`).setStyle(queue.autoPause ? ButtonStyle.Success : ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId('settings_source').setLabel(`Source: ${queue.defaultSource}`).setStyle(ButtonStyle.Primary)
+          );
+          await interaction.update({ embeds: [embed], components: [row1] });
+        } else if (customId === 'settings_source') {
+          const sources: ('youtube' | 'spotify' | 'soundcloud')[] = ['youtube', 'spotify', 'soundcloud'];
+          const currentIndex = sources.indexOf(queue.defaultSource);
+          queue.defaultSource = sources[(currentIndex + 1) % sources.length];
+          const embed = new EmbedBuilder()
+            .setTitle('VC Settings')
+            .setDescription('Configure the bot\'s behavior in voice channels.')
+            .setColor(0x0099FF);
+          const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder().setCustomId('settings_247').setLabel(`24/7 Mode: ${queue.loop ? 'ON' : 'OFF'}`).setStyle(queue.loop ? ButtonStyle.Success : ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId('settings_autopause').setLabel(`Auto-Pause: ${queue.autoPause ? 'ON' : 'OFF'}`).setStyle(queue.autoPause ? ButtonStyle.Success : ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId('settings_source').setLabel(`Source: ${queue.defaultSource}`).setStyle(ButtonStyle.Primary)
+          );
+          await interaction.update({ embeds: [embed], components: [row1] });
+        }
       }
+    }
+  });
+
+  botClient.on('voiceStateUpdate', async (oldState, newState) => {
+    if (!oldState.guild) return;
+    const guildId = oldState.guild.id;
+    const queue = queues.get(guildId);
+    if (!queue || !queue.connection) return;
+
+    const botChannelId = queue.connection.joinConfig.channelId;
+    if (!botChannelId) return;
+
+    // We only care if the bot is in the channel that changed
+    if (oldState.channelId !== botChannelId && newState.channelId !== botChannelId) return;
+
+    try {
+      const channel = await oldState.guild.channels.fetch(botChannelId);
+      if (!channel || !channel.isVoiceBased()) return;
+
+      const membersInChannel = channel.members.filter(m => !m.user.bot).size;
+
+      if (membersInChannel === 0) {
+        if (queue.autoPause && queue.playing && !queue.paused) {
+          queue.player.pause();
+          queue.paused = true;
+          queue.seekTime += (Date.now() - queue.streamStartTime) / 1000;
+          queue.aloneTime = Date.now();
+          updatePanel(guildId);
+        }
+      } else if (membersInChannel > 0 && queue.aloneTime) {
+        const timeAlone = Date.now() - queue.aloneTime;
+        queue.aloneTime = null;
+        
+        if (timeAlone > 20000 && queue.autoPause && queue.paused) {
+          await playVoiceover('Aaron continuing where you paused Key=91dbdl', queue.connection, queue.player);
+          queue.player.unpause();
+          queue.paused = false;
+          queue.streamStartTime = Date.now();
+          updatePanel(guildId);
+        } else if (queue.autoPause && queue.paused) {
+          queue.player.unpause();
+          queue.paused = false;
+          queue.streamStartTime = Date.now();
+          updatePanel(guildId);
+        }
+      }
+    } catch (e) {
+      console.error('Voice state update error:', e);
     }
   });
 
